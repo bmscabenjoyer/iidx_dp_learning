@@ -56,15 +56,30 @@ note types are rare — most charts contain only taps and CNs.
 
 ### Gauge types and their difficulty relationship
 Ereter publishes three separate statistical ratings:
-- **EC (Easy Clear):** lenient gauge, forgiving recovery — lower effective
-  difficulty, most players clear first.
-- **HC (Hard Clear):** gauge falls fast and cannot recover below 30% — punishes
-  walls and dense runs heavily.
-- **EXH (EX-Hard):** any miss kills the gauge immediately — near-perfect play
-  required; strongly correlated with burst density.
+- **EC (Easy Clear):** lenient groove gauge — PGREAT/GREAT adds proportional
+  recovery, GOOD subtracts ~1.6%, BAD/空POOR ~4.8%, must reach 80% to clear.
+- **HC (Hard Clear):** survival gauge — PGREAT/GREAT +0.16%, GOOD 0%,
+  BAD/空POOR −5%, POOR −9%; 30% correction halves BAD/空POOR damage when gauge
+  < 30%; cannot recover below 30% in the same way groove can.
+- **EXH (EX-Hard):** survival gauge — PGREAT/GREAT +0.16%, GOOD 0%,
+  BAD/空POOR −10%, POOR −18%; NO 30% correction.
 
 The stat rating captures real-world aggregate difficulty, which is why it's
 more informative than the official integer level.
+
+### Gauge mechanics (verified from namu.wiki)
+
+| Event | EC/Normal | HARD | EX HARD |
+|---|---|---|---|
+| PGREAT | +a | +0.16% | +0.16% |
+| GREAT | +a/2 | +0.16% | +0.16% |
+| GOOD | −1.6% (−2.0%) | 0% | 0% |
+| BAD / 空POOR | −4.8% (−6.0%) | −5% | −10% |
+| POOR | same as BAD | −9% | −18% |
+| 30% correction | N/A | O (halves BAD/空POOR below 30%) | X |
+
+EC recovery constant: `a = (80000/(notes×6))/50` if notes < 350;
+`a = (80000/(notes×2+1400))/50` if notes ≥ 350.
 
 ### What makes a chart hard (DP-specific)
 - **Cross-hand patterns:** notes requiring the right hand to play on the P1
@@ -78,6 +93,9 @@ more informative than the official integer level.
   (especially sudden drops/jumps) add reading difficulty independently.
 - **Note count vs. chart length:** stamina charts have sustained density; burst
   charts have local peaks.
+- **Hard endings:** a difficult final section specifically punishes HC (player
+  has no gauge buffer to spend) — the reason ABMIL (permutation-invariant) is
+  wrong for this problem.
 
 ---
 
@@ -131,7 +149,7 @@ chart with ereter stats joined on (title, diff_type, level). Key columns:
 
 | Column | Description |
 |---|---|
-| `id` | chart file stem |
+| `file_path` | relative path to the `.npy` file within the level directory (e.g. `charts/foo_DAC00.npy`) |
 | `title` | song title |
 | `diftype` | e.g. `[DP ANOTHER]` |
 | `level` | 10, 11, or 12 |
@@ -151,8 +169,14 @@ charts have decimal ratings (93.6%). lv10/11 have counts but no decimal rating.
 
 | Level | Label type | Notes |
 |---|---|---|
-| 12 | `rating_stat` (float, ~10.0–13.0 range) | Primary regression target |
+| 12 | `rating_ec`, `rating_hc`, `rating_exh` (float) | Three-head regression targets; use `rating_stat` for single-value eval |
 | 10–11 | Ordinal / range derived from clear counts | Used for "ladder" pretraining to avoid overfitting on lv12 alone |
+
+**Regression target distribution (lv12):**
+- `rating_stat`: std ≈ 0.21, mean ≈ 12.0 — very narrow; naive mean predictor MAE ≈ 0.17
+- `rating_ec` / `rating_hc` / `rating_exh`: std ≈ 2.7 / 2.1 / 1.5 — much wider; use these as primary training targets
+- EXH−EC gap: mean ≈ 6.06, std ≈ 1.65 → burst proxy
+- HC−EC gap: wall/density proxy
 
 The clear counts for lv10/11 can be used to construct a soft ordinal signal:
 charts with very low EC count relative to total players are harder than charts
@@ -160,63 +184,197 @@ with near-universal clears.
 
 ---
 
-## Modelling approach
+## Input representation
 
-### Input representation
-Full charts are too long (often 100–300+ bars) for direct processing. The plan
-is to window into fixed-size segments:
+### BPM fill-forward
+Column 16 stores BPM only at change events. Fill forward to produce a
+dense `bpm[row]` array. Convert to BPM directly (divide by 100).
 
-1. **Windowing:** Slice each chart into overlapping **4-bar segments**
-   (4 × 192 = 768 rows). Stride TBD (2-bar stride suggested).
-2. **Optional re-representation:** Convert the 0–9 encoding to a two-channel
-   form before feeding to the model:
-   - *Action channel*: 1 at every head/tail event (tap, CN head/tail, etc.)
-   - *Sustain channel*: non-zero during hold bodies, with magnitude encoding
-     strictness (HCN > CN, BSS/MSS > regular)
-   Temporal Gaussian decay on the action channel only can give the model soft
-   look-ahead context without blurring hold structure.
-3. **BPM feature:** Include the BPM column (or derived tempo in BPM directly)
-   as an additional input channel.
+### Two-channel note encoding
+Convert the 0–9 lane encoding to two channels per lane before feeding to the model:
 
-### Architecture sketch
+- **Action channel** (channel 0): 1.0 at tap notes, CN/HCN/BSS/MSS heads, and CN/HCN
+  tail rows. Represents "motor event required."
+- **Sustain channel** (channel 1): 1.0 during CN body, 2.0 during HCN body,
+  0.5 during BSS/MSS body. Represents "hold currently required."
+
+Input tensor shape: `(total_rows, 16, 2)` per chart — 16 lanes × 2 channels.
+With BPM as a separate scalar channel per row: `(total_rows, 16×2 + 1)`.
+
+### Gaussian note smearing
+Apply a BPM-aware Gaussian blur to the action channel only (not sustain bodies):
+
 ```
-4-bar window (768 × 17)
-        ↓
-  CNN encoder (or small Transformer)
-        ↓
-  128-dim segment embedding
-        ↓  (repeated for all windows in a chart)
-  Aggregator:
-    - MaxPool  → captures peak/wall difficulty  (→ HC/EXH proxy)
-    - MeanPool → captures sustained density     (→ EC proxy)
-        ↓
-  Song-level embedding (256-dim concat or learned mix)
-        ↓
-  Regression head → decimal rating
-  (+ optional per-gauge heads for EC / HC / EXH)
+σ(bpm) ≈ 0.022 × (bpm / 150)   [in seconds, GREAT window ≈ ±33ms]
+σ_rows  = σ(bpm) × (bpm/60 × 48)   # convert to row units
 ```
 
-Multi-task learning over the three gauge ratings is attractive because EC/HC/EXH
-provide three correlated but distinct difficulty signals from the same chart.
+At 150 BPM: σ ≈ 4 rows; at 200 BPM: σ ≈ 5 rows.
+Smearing gives the model soft look-ahead context reflecting human timing windows.
+Do NOT smear CN/HCN/BSS body rows (sustain channel).
 
-### Loss function
-- **lv12:** MSE (or Huber) on decimal rating.
-- **lv10/11:** Range loss or pairwise ranking loss derived from clear counts.
-- Combined weighted loss during joint training.
+### Windowing
+Slice each chart into overlapping **4-bar segments** (4 × 192 = 768 rows).
+Suggested stride: 2 bars (384 rows). Store note count per segment for gauge sim.
 
-### Augmentation
-IIDX DP charts have natural symmetries that should be exploited:
-- **Mirror (flip):** Reverse all columns within each side independently
-  (key 1↔7, 2↔6, 3↔5, 4 stays). Preserves physical ergonomics.
-- **Side-swap (FLIP mode):** Swap P1 and P2 sides entirely (lanes 0–7 ↔ 8–15,
-  swapping scratch positions). Also a legal chart variant in-game.
-These two augmentations can 4× the effective dataset size.
+---
+
+## Model architecture
+
+### Overview
+
+```
+Chart (sequence of T 4-bar segments)
+         │
+         ▼
+  CNN Encoder (shared, pretrained)
+  Input: (768, 33) per segment   [16 lanes × 2 channels + 1 BPM]
+         │
+         │  [e₁, e₂, ..., eₜ]  128-dim per segment
+         │
+    ┌────┴──────────┬──────────────┐
+    ▼               ▼              ▼
+  HC damage head  EXH damage head  EC damage head
+  outputs per segment:
+    r[t]       = recovery rate (fraction of notes that are PGREAT/GREAT)
+    d_bad[t]   = bad/空poor rate
+    d_poor[t]  = poor rate
+         │               │              │
+         ▼               ▼              ▼
+  HC simulation    EXH simulation   EC simulation
+  (sequential,     (no 30% corr.)   (groove recovery)
+   30% corr.)
+         │               │              │
+         ▼               ▼              ▼
+  HC trajectory   EXH trajectory   EC trajectory
+         │               │              │
+         └───────┬────────┘              │
+                 ▼                       ▼
+           Gauge profile          EC rating head
+           features               (MLP → rating_ec)
+           [min, final, p75, p90]
+                 │
+                 ▼
+          HC rating head     EXH rating head
+          (MLP → rating_hc)  (MLP → rating_exh)
+
+  Combined loss: MSE on rating_ec + rating_hc + rating_exh
+  Eval: rating_stat = f(ec, hc, exh) — or predict directly
+```
+
+### CNN encoder
+- Input: `(768, 33)` per 4-bar window — flatten to `(768, 33)` or treat as
+  `(33, 768)` image-like
+- First conv kernel should span all 16 lanes to capture cross-hand patterns:
+  `kernel=(1, 16)` then temporal convolutions on top
+- Target: 128-dim segment embedding
+
+### Damage heads
+Each of the three heads is a small MLP on top of the segment embedding.
+Outputs must be in [0, 1] (use sigmoid). Interpretation:
+- `r[t]`: fraction of note events in segment that yield PGREAT/GREAT recovery
+- `d_bad[t]`: fraction of note events that yield BAD/空POOR
+- `d_poor[t]`: fraction of note events that yield POOR (real miss)
+
+Note count per segment `n[t]` is computed from the chart data (not learned).
+
+### Differentiable gauge simulation
+
+HC simulation (pseudocode):
+```python
+g = 1.0
+for t in range(T):
+    n = note_count[t]
+    recovery   = r[t]    * n * 0.0016
+    drain_bad  = d_bad[t] * n * 0.05
+    drain_poor = d_poor[t] * n * 0.09
+    # soft 30% correction gate (differentiable)
+    correction = sigmoid((g - 0.30) * 20)          # ≈1 above 30%, ≈0.5 at floor
+    drain_bad  = drain_bad * (0.5 + 0.5 * correction)
+    g = clip(g - drain_bad - drain_poor + recovery, 0.0, 1.0)
+    trajectory.append(g)
+```
+
+EXH simulation: same but no 30% correction; drain_bad multiplier = 0.10,
+drain_poor multiplier = 0.18.
+
+EC simulation: groove recovery model — recovery proportional to r[t] × a(n),
+drain proportional to d_bad[t] × 0.048; clip to [0, 1]; target ≥ 0.80 to clear.
+
+The simulation has **no learned parameters** — only r[t]/d_bad[t]/d_poor[t]
+from the damage heads are learned. All arithmetic is differentiable; use
+soft-min instead of hard min for gradient flow through the minimum operation.
+
+### Why not ABMIL
+Attention-Based MIL treats segments as an unordered bag — permutation invariant.
+This is wrong for IIDX: a hard ending is specifically punishing for HC because
+the gauge has no buffer to spend (see Go Beyond!! EC=1.1, HC=11.4, gap=10.3).
+The gauge simulation enforces causal temporal structure that ABMIL cannot capture.
+
+---
+
+## Training strategy
+
+### Baseline first
+Before the CNN, build a GBT (XGBoost/LightGBM) baseline on handcrafted features:
+- Note count, chord density (mean / max / std per bar)
+- Scratch lane activity (lanes 0 and 15)
+- BPM statistics
+- Cross-hand note fraction
+This is not a throwaway — it may be competitive given the small labeled dataset
+(684 lv12 charts) and provides a MAE floor to beat.
+
+### Self-supervised pretraining (BYOL)
+Pretrain the CNN encoder on all segments from all levels (lv10/11/12) with no
+labels required — 50K+ segments available. Use BYOL (Bootstrap Your Own Latent)
+rather than SimCLR; BYOL works well on small batches without negative pairs.
+
+Augmentations for contrastive views:
+- **Mirror:** reverse key order within each side independently (key 1↔7, 2↔6, 3↔5, 4 stays)
+- **Side-swap (FLIP):** swap P1 and P2 sides entirely (lanes 0–7 ↔ 8–15)
+- Temporal crop: random 3-bar sub-window within 4-bar segment
+- Gaussian noise on action channel values
+
+### Fine-tuning
+After pretraining, fine-tune the encoder + damage heads + simulation on lv12
+labeled data. Use the three gauge ratings (EC/HC/EXH) as multi-task targets.
+
+For lv10/11: auxiliary pairwise ranking loss on clear counts
+(e.g. if chart A has much lower EC rate than chart B at same level, A > B in difficulty).
+
+### Loss
+```
+L = MSE(rating_ec) + MSE(rating_hc) + MSE(rating_exh)
+  + λ_rank × pairwise_rank_loss(lv10/11)
+```
 
 ### Evaluation
-- Primary: **MAE** on lv12 test set decimal ratings.
-- Secondary: Spearman rank correlation on lv12.
-- Sanity check: the model should respect ordinal level ordering
-  (predicted difficulty: lv10 < lv11 < lv12 on average).
+- Primary: **MAE** on lv12 test set `rating_stat`
+- Secondary: Spearman ρ on lv12 `rating_stat`
+- Sanity: predicted mean difficulty lv10 < lv11 < lv12
+
+---
+
+## Augmentation
+
+IIDX DP charts have natural symmetries:
+- **Mirror (flip):** Reverse all columns within each side independently
+  (key 1↔7, 2↔6, 3↔5, 4 stays). Preserves physical ergonomics. Lanes: P1 1↔6, 2↔5, 3↔4; P2 8↔13, 9↔12, 10↔11.
+- **Side-swap (FLIP mode):** Swap P1 and P2 sides entirely (lanes 0–7 ↔ 8–15,
+  swapping scratch positions). Also a legal chart variant in-game.
+
+These two augmentations can 4× the effective dataset size.
+
+---
+
+## Pattern archetype discovery (sub-goal)
+
+After pretraining, run K-means on the 128-dim segment embeddings from all charts.
+Each cluster centre is a "pattern archetype" (e.g. scratch wall, symmetric trill,
+chord stream). Assign each segment to its nearest archetype.
+
+Per-chart archetype histogram: fraction of segments belonging to each cluster.
+This histogram is a compact chart fingerprint for similarity search.
 
 ---
 
