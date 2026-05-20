@@ -262,12 +262,13 @@ Chart (sequence of T 4-bar segments)
   Eval: rating_stat = f(ec, hc, exh) — or predict directly
 ```
 
-### CNN encoder
-- Input: `(768, 33)` per 4-bar window — flatten to `(768, 33)` or treat as
-  `(33, 768)` image-like
-- First conv kernel should span all 16 lanes to capture cross-hand patterns:
-  `kernel=(1, 16)` then temporal convolutions on top
-- Target: 128-dim segment embedding
+### Transformer encoder (implemented)
+- Input: `(768, 17)` per 4-bar window (v4 encoding)
+- PatchEmbed: linear projection of each `(patch_rows × in_channels)` patch → embed_dim
+- 6-layer TransformerEncoder, embed_dim=128, 4 heads, mlp_ratio=4, dropout=0.1
+- CLS token prepended; density conditioning added to CLS before transformer
+- Output: CLS embedding = 128-dim segment representation
+- Checkpoint: `checkpoints/pretrain_v4/encoder_best.pt` (4.7 MB)
 
 ### Damage heads
 Each of the three heads is a small MLP on top of the segment embedding.
@@ -324,16 +325,45 @@ Before the CNN, build a GBT (XGBoost/LightGBM) baseline on handcrafted features:
 This is not a throwaway — it may be competitive given the small labeled dataset
 (684 lv12 charts) and provides a MAE floor to beat.
 
-### Self-supervised pretraining (BYOL)
-Pretrain the CNN encoder on all segments from all levels (lv10/11/12) with no
-labels required — 50K+ segments available. Use BYOL (Bootstrap Your Own Latent)
-rather than SimCLR; BYOL works well on small batches without negative pairs.
+### Self-supervised pretraining (MAE)
+We use **Masked Autoencoder (MAE)** rather than BYOL. MAE masks a fraction of
+patches and reconstructs them from the unmasked context. The encoder is a
+Transformer (not CNN — see architecture section).
 
-Augmentations for contrastive views:
-- **Mirror:** reverse key order within each side independently (key 1↔7, 2↔6, 3↔5, 4 stays)
-- **Side-swap (FLIP):** swap P1 and P2 sides entirely (lanes 0–7 ↔ 8–15)
-- Temporal crop: random 3-bar sub-window within 4-bar segment
-- Gaussian noise on action channel values
+**Current encoding (v4):**
+- 16-channel single float per lane: `0.0`=empty, `1.0`=tap/head, `0.5`=hold body
+- **No smear on key lanes (1–14)** — raw binary exact note positions only
+- Scratch lanes (0, 15): ±1 row smear only (3-row kernel) to absorb quantisation jitter
+- BPM at column 16, normalised by 250.0
+- Shape per window: `(768, 17)`
+
+**Why no smear:** fat-binary smearing (originally ±5 rows for keys) causes
+cross-patch information leakage at 12-row patch resolution — visible patches
+bleed note information into adjacent masked patches, making reconstruction
+trivial. Removing smear forces genuine chord prediction from context.
+
+**MAE hyperparameters (v4d — current best):**
+- Patch size: 12 rows (16th-note resolution), 64 patches per window
+- Mask ratio: **50%** — 32 visible patches = 2 full bars of context
+- Event-weighted loss: `event_weight=100`, `empty_weight=1`
+  - Event row = any lane ≥ 0.9 in that row
+  - Prevents predict-zeros local minimum (which occurs at event_weight ≤ 10)
+- Density-weighted masking: denser patches masked more often
+- Density conditioning: log(1+notes/sec) added to CLS token
+
+**Why 50% not 75%:** IIDX charts lack the spatial redundancy of natural images.
+At 75% masking the model sees only 1 bar of context and must predict 3 bars —
+even expert players cannot reliably do this. 50% gives 2 bars of context, which
+is sufficient to predict pattern continuation.
+
+**Augmentations (8× dataset):**
+- Mirror-P1, Mirror-P2, Mirror-both, Side-swap, and combinations
+- Window density-weighted sampling: `sqrt(note_count) + 1.0`
+
+**Auxiliary task (zasa):**
+Combined difficulty labels: lv10/11 zasa ratings + lv12 ereter `rating_stat`
+(same scale, mean=11.174, std=0.926). CLS token predicts normalised difficulty
+with weight=0.1. Covers 97.8% of windows vs 67.9% with lv12-only labels.
 
 ### Fine-tuning
 After pretraining, fine-tune the encoder + damage heads + simulation on lv12
@@ -375,6 +405,78 @@ chord stream). Assign each segment to its nearest archetype.
 
 Per-chart archetype histogram: fraction of segments belonging to each cluster.
 This histogram is a compact chart fingerprint for similarity search.
+
+---
+
+## Pretraining experiment history
+
+### Encoding evolution
+| Version | Channels | Smear | Patches | Mask | Event weight | Zasa ep100 |
+|---------|----------|-------|---------|------|-------------|------------|
+| v2 | 32 (16 lanes × tap+hold) | ±5 rows keys | 16 (beat) | 75% | cell-level ×4 | ~0.343 |
+| v3 | 16 (merged hold 0.5) | ±5 rows keys | 16 (beat) | 75% | cell-level ×4 | ~0.38 (ep34) |
+| v4d | 16 (raw binary) | none (scratch ±1) | 64 (16th-note) | **50%** | row-level ×100 | **0.286** |
+
+### Key lessons learned
+
+**Smear hurts at sub-beat patch resolution.** The ±5-row fat-binary smear was
+designed for beat-level (48-row) patches where leakage across patches was
+acceptable. At 12-row patches the smear spans nearly the full patch and bleeds
+into adjacent patches, making reconstruction trivial — the model follows smear
+gradients rather than learning chord patterns.
+
+**75% masking is wrong for sparse chart data.** Natural image MAE uses 75%
+because images have high spatial redundancy. IIDX charts at 75% masking show
+only 1 bar of context (16 of 64 patches) — the task is unsolvable even for
+expert players. 50% (2 bars visible) is the right tradeoff: enough context to
+predict pattern continuation, hard enough to force genuine learning.
+
+**Event-weight must overcome the predict-zeros floor.** With raw binary and
+sparse notes (~5% event rows), event_weight ≤ 10 allows the model to converge
+to predict-zeros (MSE ≈ 0.062) as a local minimum. The predict-zeros floor is:
+`fraction_event_rows × (notes_per_row/lanes) × event_weight ≈ 0.625`.
+event_weight=100 pushes the floor above 0.6, forcing the model to predict notes.
+
+**Recon loss scale is not comparable across configurations** due to different
+event weights. Use zasa RMSE as the cross-run quality metric.
+
+**Zasa convergence rate as encoder quality proxy:**
+- The CLS token predicting normalised difficulty is a reliable signal for
+  whether the encoder is learning useful representations
+- Normalised zasa MSE of 0.286 → RMSE ≈ 0.50 difficulty points on the
+  lv10–12 scale (3-point range) ≈ 17% of range error
+
+### Current best checkpoint
+`checkpoints/pretrain_v4/encoder_best.pt` — v4d run, 100 epochs.
+Final: loss=0.543, recon=0.514, zasa=0.286.
+
+---
+
+## Next steps
+
+### Immediate: linear probe (do this before fine-tuning)
+Freeze the encoder. Train a single linear layer on lv12 `rating_stat` using
+CLS embeddings from `encoder_best.pt`. Target: MAE < 0.15 (naive mean predictor
+floor). This validates whether representations transfer before investing in the
+full fine-tuning pipeline.
+
+```python
+# Quick probe: CLS embed → linear → rating_stat
+probe = nn.Linear(128, 1)
+# freeze encoder, train probe on 684 lv12 charts
+```
+
+If MAE > 0.15, encoder needs more work (larger model, more epochs, or BYOL).
+If MAE < 0.15, proceed to fine-tuning.
+
+### Fine-tuning pipeline (not yet implemented)
+1. Damage heads (3× MLP: r[t], d_bad[t], d_poor[t] per segment)
+2. Differentiable gauge simulation (HC, EXH, EC — see architecture section)
+3. Rating heads (MLP on gauge trajectory features → EC/HC/EXH ratings)
+4. Loss: MSE(rating_ec) + MSE(rating_hc) + MSE(rating_exh)
+
+### GBT baseline (not yet done)
+XGBoost/LightGBM on handcrafted features as a MAE floor to beat.
 
 ---
 
