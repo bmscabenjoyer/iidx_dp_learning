@@ -82,8 +82,6 @@ EC recovery constant: `a = (80000/(notes×6))/50` if notes < 350;
 `a = (80000/(notes×2+1400))/50` if notes ≥ 350.
 
 ### What makes a chart hard (DP-specific)
-- **Cross-hand patterns:** notes requiring the right hand to play on the P1
-  side or vice versa.
 - **Scratch-key walls:** simultaneous scratch + key notes (especially double
   scratch); lane 0 and lane 15 activity alongside dense keys.
 - **Symmetric vs. asymmetric:** symmetric patterns (mirror-image between P1
@@ -321,7 +319,6 @@ Before the CNN, build a GBT (XGBoost/LightGBM) baseline on handcrafted features:
 - Note count, chord density (mean / max / std per bar)
 - Scratch lane activity (lanes 0 and 15)
 - BPM statistics
-- Cross-hand note fraction
 This is not a throwaway — it may be competitive given the small labeled dataset
 (684 lv12 charts) and provides a MAE floor to beat.
 
@@ -447,36 +444,95 @@ event weights. Use zasa RMSE as the cross-run quality metric.
   lv10–12 scale (3-point range) ≈ 17% of range error
 
 ### Current best checkpoint
-`checkpoints/pretrain_v4/encoder_best.pt` — v4d run, 100 epochs.
+`checkpoints/pretrain_v6/encoder_best.pt` — v6 run (v4d encoding + zasa aux).
 Final: loss=0.543, recon=0.514, zasa=0.286.
+
+---
+
+## Fine-tuning experiment history
+
+### Gauge simulation approach — FAILED
+
+`finetune.py`: frozen v6 encoder → damage head (256→64→3, sigmoid) →
+differentiable HC/EXH/EC simulation → trajectory features → 3 rating heads.
+
+**5-fold CV results (fold 1 only, run abandoned):**
+
+| target | MAE | ρ | XGB MAE | XGB ρ |
+|--------|-----|---|---------|-------|
+| EC | 2.0506 | 0.513 | 1.4570 | 0.7303 |
+| HC | 1.4558 | 0.419 | 1.0998 | 0.7316 |
+| EXH | 1.1711 | 0.292 | 0.8363 | 0.6920 |
+
+**Root cause:** The damage head (r, d_bad, d_poor) is asked to output
+physically meaningful gauge rates from a frozen CLS embedding that was only
+pretrained on `rating_stat` (std ≈ 0.21, very narrow). The head has no direct
+supervision signal for per-note hit rates — it must infer them indirectly from
+MSE on the downstream rating. With 550 training charts, the gradient chain
+encoder → damage → simulation → trajectory → rating is too long and the damage
+head learns degenerate outputs. The indirect path fails when the encoder
+representations don't already encode per-gauge information.
+
+**Implementation notes learned:**
+- `@torch.jit.script` requires a real `.py` file (not `python -c` or heredoc)
+  and needs `from typing import List` for typed lists in loops
+- Sequential scalar gauge sim is ~100× faster on CPU than CUDA (kernel launch
+  overhead dominates at scalar granularity); use `torch.set_num_threads(1)` too
+- Always use `flush=True` and `PYTHONUNBUFFERED=1` for background training output
+
+### Direct regression — competitive with XGB
+
+`finetune_direct.py`: frozen encoder → mean-pool CLS across windows →
+PCA(128) + 8 note-profile features → RidgeCV → EC/HC/EXH ratings.
+
+**Note-profile features** (from per-window note counts `win_nc`):
+1. `mean(nc)` — average density
+2. `std(nc)` — density variation
+3. `max(nc)` — peak density
+4. `p75(nc)` — upper quartile density
+5. `p25(nc)` — lower quartile density
+6. `mean(last_25%) / mean(nc)` — hard-ending ratio
+7. `std/mean` — burstiness (CV)
+8. `sum(nc)` — total notes (chart length proxy)
+
+**5-fold CV results (v6 encoder, PCA 128 + 8 note-profile = 136 features):**
+
+| target | naive | XGB MAE | Ridge MAE | XGB ρ | Ridge ρ |
+|--------|-------|---------|-----------|-------|---------|
+| rating_ec | 2.2792 | 1.4570 | **1.4608±0.071** | 0.7303 | **0.7511** |
+| rating_hc | 1.6715 | 1.0998 | 1.1140±0.055 | 0.7316 | 0.7258 |
+| rating_exh | 1.1977 | 0.8363 | 0.8377±0.023 | 0.6920 | 0.6872 |
+
+MAE is essentially tied with XGB on all three; EC Spearman ρ beats XGB.
+Chosen alpha ≈ 29–41 (logspace sweep 0.1–100000, inner cv=5).
+
+**Key insight: plain Ridge(256) was much worse (ρ=0.65–0.70).**
+- 256 raw embedding features / ~550 training samples → overfitting even with
+  RidgeCV — not a regularisation problem, a dimensionality problem
+- PCA(128) gives better OOS performance by discarding noise dimensions
+- Note-profile features add orthogonal signal: density distribution that the
+  CLS embedding doesn't directly encode
+- Note: PCA and scalers currently fit on all 684 charts (slight leakage for
+  unsupervised steps) — would be cleaner to fit inside fold, but impact is minor
 
 ---
 
 ## Next steps
 
-### Immediate: linear probe (do this before fine-tuning)
-Freeze the encoder. Train a single linear layer on lv12 `rating_stat` using
-CLS embeddings from `encoder_best.pt`. Target: MAE < 0.15 (naive mean predictor
-floor). This validates whether representations transfer before investing in the
-full fine-tuning pipeline.
+### Encoder fine-tuning (end-to-end)
+Unfreeze the encoder and train end-to-end with rating heads. The frozen probe
+shows ρ≈0.75, suggesting the encoder already encodes useful features. With
+fine-tuning, the encoder can adapt to per-gauge targets (std 1.5–2.7, much
+wider than the zasa pretraining target). Expected gain: Δρ ≈ 0.05–0.10.
 
-```python
-# Quick probe: CLS embed → linear → rating_stat
-probe = nn.Linear(128, 1)
-# freeze encoder, train probe on 684 lv12 charts
-```
-
-If MAE > 0.15, encoder needs more work (larger model, more epochs, or BYOL).
-If MAE < 0.15, proceed to fine-tuning.
-
-### Fine-tuning pipeline (not yet implemented)
-1. Damage heads (3× MLP: r[t], d_bad[t], d_poor[t] per segment)
-2. Differentiable gauge simulation (HC, EXH, EC — see architecture section)
-3. Rating heads (MLP on gauge trajectory features → EC/HC/EXH ratings)
-4. Loss: MSE(rating_ec) + MSE(rating_hc) + MSE(rating_exh)
+Training setup:
+- Low LR for encoder (1e-5), higher LR for head (1e-3)
+- Separate BN/LN statistics per fold
+- 3-target MSE loss: EC + HC + EXH
 
 ### GBT baseline (not yet done)
-XGBoost/LightGBM on handcrafted features as a MAE floor to beat.
+XGBoost/LightGBM on handcrafted features to understand what the encoder adds
+vs. pure feature engineering.
 
 ---
 
