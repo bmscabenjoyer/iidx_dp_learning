@@ -15,3 +15,8 @@ runs/
 *.pt
 *.pth
 *.ckpt
+
+# Generated caches, embeddings, and run logs
+cache/
+embeddings/
+*.log
